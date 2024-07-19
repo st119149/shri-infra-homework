@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        job: [lint, test]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 16
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run linter
+        if: matrix.job == 'lint'
+        run: npm run lint
+
+      - name: Run tests
+        if: matrix.job == 'test'
+        run: npm run test
+
+  create-release-branch:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          ref: main
+
+      - name: Create release branch
+        run: |
+          git checkout -b releases/${{ github.run_number }}
+          git push origin releases/${{ github.run_number }}
+
+  build-and-push-docker-image:
+    runs-on: ubuntu-latest
+    needs: create-release-branch
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in to Yandex Container Registry
+        env:
+          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: echo "${{ secrets.YC_TOKEN }}" | docker login -u oauth --password-stdin cr.yandex
+
+      - name: Build and tag Docker image
+        run: |
+          docker build -t cr.yandex/fv4fmp7jhr0483orh6e9/app:${{ github.run_number }} .
+          docker tag cr.yandex/fv4fmp7jhr0483orh6e9/app:${{ github.run_number }} cr.yandex/fv4fmp7jhr0483orh6e9/app:${{ github.run_number }}_latest
+
+      - name: Push Docker image
+        run: |
+          docker push cr.yandex/fv4fmp7jhr0483orh6e9/app:${{ github.run_number }}
+          docker push cr.yandex/fv4fmp7jhr0483orh6e9/app:${{ github.run_number }}_latest
+
+  create-tag:
+    runs-on: ubuntu-latest
+    needs: build-and-push-docker-image
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          ref: main
+
+      - name: Create tag
+        run: |
+          git tag -a v${{ github.run_number }} -m "Release ${{ github.run_number }}"
+          git push origin v${{ github.run_number }}
+
+  create-issue:
+    runs-on: ubuntu-latest
+    needs: create-tag
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Get previous release tag
+        id: prev-tag
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^)
+          echo "::set-output name=prev-tag::$PREV_TAG"
+
+      - name: Generate commit list
+        id: commits
+        run: |
+          COMMITS=$(git log --pretty=format:"%h - %s" ${{ steps.prev-tag.outputs.prev-tag }}..HEAD)
+          echo "::set-output name=commits::$COMMITS"
+
+      - name: Create release issue
+        uses: actions/create-issue@v2
+        with:
+          title: Release ${{ github.run_number }}
+          body: |
+            **Release Date:** ${{ github.event.head_commit.timestamp }}
+            **Release Author:** ${{ github.actor }}
+            **Version:** ${{ github.run_number }}
+            **Commits since last release:** 
+            ${{ steps.commits.outputs.commits }}
+            **Docker Image:** cr.yandex/fv4fmp7jhr0483orh6e9/app:${{ github.run_number }}
+
+  update-changelog:
+    runs-on: ubuntu-latest
+    needs: create-issue
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Update CHANGELOG.md
+        run: |
+          echo "## Version ${{ github.run_number }} - $(date +'%Y-%m-%d')" > new_changelog.md
+          echo "${{ steps.commits.outputs.commits }}" >> new_changelog.md
+          echo "" >> new_changelog.md
+          cat CHANGELOG.md >> new_changelog.md
+          mv new_changelog.md CHANGELOG.md
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "Update CHANGELOG.md for release ${{ github.run_number }}"
+          git push origin main
